@@ -1,0 +1,21 @@
+{
+  "presets": [
+    "@babel/preset-env",
+    "@babel/preset-typescript",
+    ["@babel/preset-react", { "runtime": "automatic", "importSource": "@emotion/react" }]
+  ],
+  "plugins": ["@emotion/babel-plugin"],
+  "env": {
+    "test": {
+      "plugins": ["istanbul"]
+    },
+    "development": {
+      "plugins": [
+        "jotai/babel/plugin-debug-label", // Not working!
+        "react-refresh/babel",
+        "jotai/babel/plugin-react-refresh",
+        "istanbul"
+      ]
+    }
+  }
+}

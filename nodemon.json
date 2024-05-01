@@ -1,0 +1,7 @@
+{
+  "verbose": true,
+  "watch": ["./.env", "./.env.defaults", "./config/webpack/*.*"],
+  "env": {
+    "NODE_ENV": "development"
+  }
+}

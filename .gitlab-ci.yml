@@ -1,0 +1,475 @@
+image: registry.preprod.anywhere.navify.com/docker.io/library/node:20.4.0
+
+variables:
+  FF_ENABLE_BASH_EXIT_CODE_CHECK: 'false'
+  # This variable determines where the env bundle js file is located in the build artifact
+  ENV_INJECTION_FILE: build/prod/env.bundle.*.js
+  AWS_DEV_ACCOUNT_ID: '346862775520'
+  AWS_DEV_ECR_FRONTEND_COSMOS_REPO_NAME: 'cosmos-lb-frontend'
+  AWS_PROD_ACCOUNT_ID: '296370534383'
+  AWS_PROD_ECR_RUNTIME_COSMOS_REPO_NAME: 'cosmos-lb-frontend'
+
+before_script:
+  # Install gettext package to have access to envsubst command
+  #- apk update && apk add gettext
+  # Setup npm to download local registry packages
+  - echo "//code.roche.com/api/v4/packages/npm/:_authToken=${NPM_TOKEN}" >> .npmrc
+  - echo -e "@one:registry=https://code.roche.com/api/v4/packages/npm/" >> .npmrc
+
+include:
+  - local: .gitlab/*.yaml
+  - project: 'lni/modules/pipeline-templates/common-templates'
+    file:
+      - 'aws-lib.yaml'
+      - 'gitops-lib.yaml'
+      - 'libci.yaml'
+      - 'crane-lib.yaml'
+      - 'kaniko-lib.yaml'
+      - 'helm-lib.yaml'
+      - '/helpers/publish-xray.yaml'
+    ref: master
+
+.ca_runners:
+  tags:
+    - amd64
+    - linux
+    - docker
+    - cache
+    - on-prem
+    - debian
+
+.ca_runners_privileged:
+  tags:
+    - amd64
+    - linux
+    - docker
+    - cache
+    - on-prem
+    - tr-2
+    - debian
+
+.nci_runners:
+  tags:
+    - nci
+    - linux
+    - cache
+    - on-prem
+
+.npm_cache:
+  cache: &npm_cache
+    - key:
+        files:
+          - package-lock.json
+        prefix: install-frontend
+      paths:
+        - node_modules/
+      policy: pull
+
+.deploy-dev-rules:
+  rules:
+    - if: '$CI_COMMIT_BRANCH !~ /^doc\/.*/ && $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE != "trigger"'
+    - if: '$CI_COMMIT_TAG && $CI_PIPELINE_SOURCE != "trigger"'
+      when: never
+
+.deploy-qa-rules:
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^\d+\.\d+\.\d+(-[a-zA-Z0-9.\-_]+)?$/ && $CI_PIPELINE_SOURCE != "trigger"'
+
+stages:
+  - install
+  - validate
+  - build
+  - test
+  - quality
+  - pre-publish
+  - publish
+  - deploy
+
+# *** Install ***
+'Install':
+  stage: install
+  cache:
+    - key:
+        files:
+          - package-lock.json
+        prefix: npm
+      paths:
+        - .npm/
+      when: on_success
+      policy: pull-push
+    - key:
+        files:
+          - package-lock.json
+        prefix: install-frontend
+      paths:
+        - node_modules/
+      when: on_success
+      policy: pull-push
+  extends:
+    - .ca_runners
+  artifacts:
+    reports:
+      dotenv: version.env
+  script:
+    - npm ci --cache .npm --prefer-offline
+    - echo PROJECT_VERSION=$(npm pkg get version | tr -d "\042") >> version.env
+
+# *** Validate ***
+'Lint':
+  stage: validate
+  extends:
+    - .ca_runners
+  cache: *npm_cache
+  script:
+    - npm run lint
+  needs: ['Install']
+
+'Typecheck':
+  stage: validate
+  extends:
+    - .ca_runners
+  cache: *npm_cache
+  script:
+    - npm run typecheck
+  needs: ['Install']
+
+# *** Build ***
+'Build':
+  stage: build
+  extends:
+    - .ca_runners
+  cache: *npm_cache
+  artifacts:
+    paths:
+      - build/prod/
+  script:
+    - npm run build:prod
+  needs: ['Install']
+
+# *** Test ***
+'Unit Testing':
+  stage: test
+  extends:
+    - .ca_runners_privileged
+  cache: *npm_cache
+  artifacts:
+    when: on_success
+    paths:
+      - reports/test-unit/
+  script:
+    - npm run test:unit
+  needs: ['Install']
+
+'Contract Testing':
+  stage: test
+  extends:
+    - .ca_runners
+  cache: *npm_cache
+  artifacts:
+    when: on_success
+    paths:
+      - reports/test-contract/
+  script:
+    - npm run test:contract
+  needs: ['Install']
+
+'Upload contracts':
+  stage: test
+  extends:
+    - .ca_runners
+  image:
+    name: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/pactfoundation/pact-cli:0.50.0.31
+    entrypoint: ['']
+  rules:
+    - if: '$CI_COMMIT_BRANCH !~ /^doc\/.*/ && $CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_TAG'
+      when: never
+  needs:
+    - job: 'Build'
+    - job: 'Contract Testing'
+      artifacts: true
+  script:
+    - pact-broker publish ./reports/test-contract -a=${CI_PROJECT_TITLE}-${PROJECT_VERSION}-$CI_COMMIT_SHORT_SHA -b=$PACT_BROKER_URL -u=$PACT_BROKER_USERNAME -p=$PACT_BROKER_PASSWORD --merge --auto-detect-version-properties
+
+'Component Testing':
+  stage: test
+  image:
+    name: registry.global.anywhere.navify.com/docker.io/cypress/included:13.6.3
+    entrypoint: ['']
+  extends:
+    - .ca_runners
+  cache: *npm_cache
+  artifacts:
+    when: on_success
+    paths:
+      - reports/test-component/
+  script:
+    - npm run test:component
+  needs: ['Install']
+
+'Integration Testing':
+  stage: test
+  when: manual
+  image:
+    name: registry.global.anywhere.navify.com/docker.io/cypress/included:13.6.3
+    entrypoint: ['']
+  extends:
+    - .ca_runners
+  cache: *npm_cache
+  artifacts:
+    when: on_success
+    paths:
+      - reports/test-integration/
+  variables:
+    BASE_PORT: 8095
+  script:
+    - npx serve ./build/prod/ -p ${BASE_PORT} -s -n -d & 2>&1
+    - npx wait-on http://localhost:${BASE_PORT} && CYPRESS_BASE_URL=http://localhost:${BASE_PORT} npm run test:integration
+  needs: ['Build']
+
+# *** Quality ***
+'SonarQube':
+  stage: 'quality'
+  image:
+    name: ${CI_DEPENDENCY_PROXY_GROUP_IMAGE_PREFIX}/sonarsource/sonar-scanner-cli:latest
+    entrypoint: ['']
+  cache:
+    key: '${CI_JOB_NAME}'
+    paths:
+      - .sonar/cache
+  script:
+    - sonar-scanner
+  variables:
+    SONAR_USER_HOME: '${CI_PROJECT_DIR}/.sonar'
+    GIT_DEPTH: '0'
+    SONAR_TOKEN: $SONAR_TOKEN
+    SONAR_HOST_URL: $SONAR_HOST_URL
+    SONAR_KEY: $SONAR_KEY
+    CI_MERGE_REQUEST_IID: $CI_MERGE_REQUEST_IID
+  allow_failure: false
+
+# *** Pre-publish ***
+aws-auth:
+  stage: pre-publish
+  rules:
+    - if: '$CI_COMMIT_BRANCH !~ /^doc\/.*/ && $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE != "trigger"'
+    - if: '$CI_COMMIT_TAG && $CI_PIPELINE_SOURCE != "trigger"'
+  extends:
+    - .ca_runners
+    - .lib-aws-auth
+  variables:
+    AWS_ASSUME_ROLE_ACCOUNT_ID: '346862775520'
+    AWS_ASSUME_ROLE_NAME: gitlab-cicd-cosmos-lb-frontend
+
+# *** Publish DEV ***
+'Publish Xray definitions':
+  stage: publish
+  rules: !reference ['.deploy-dev-rules', rules]
+  when: manual
+  extends:
+    - .ca_runners
+    - .publish-xray-helper-definition
+    - .releaseable_branches
+  variables:
+    TMS_LINK_MANDATORY: 'true'
+  before_script:
+    - mkdir -p target/allure-results
+    - find -iname '*-result.json' -exec cp {} ./target/allure-results \;
+    - ls -la target/allure-results
+  needs:
+    - job: 'Unit Testing'
+    - job: 'Component Testing'
+    # - job: 'Integration Testing'
+
+'Publish dev runtime Docker Image to ECR':
+  stage: publish
+  rules: !reference ['.deploy-dev-rules', rules]
+  extends:
+    - .ca_runners
+    - .lib-kaniko-publish-oci-ecr
+  variables:
+    AWS_ECR: ${AWS_DEV_ACCOUNT_ID}.dkr.ecr.eu-central-1.amazonaws.com
+    DOCKER_FILE: Dockerfile
+    DOCKER_CONTEXT: '.'
+    IMAGE_REPOSITORY: ${AWS_DEV_ECR_FRONTEND_COSMOS_REPO_NAME}
+    IMAGE_TAG: ${PROJECT_VERSION}-${CI_COMMIT_SHORT_SHA}
+  needs:
+    # - job: 'Code Quality'
+    - job: 'Install'
+      artifacts: true
+    - job: Build
+      artifacts: true
+    - job: aws-auth
+      artifacts: true
+
+'Publish Helm Chart to ECR':
+  stage: publish
+  rules: !reference ['.deploy-dev-rules', rules]
+  extends:
+    - .ca_runners
+    - .lib-helm-publish-oci-ecr
+  variables:
+    AWS_ECR: ${AWS_DEV_ACCOUNT_ID}.dkr.ecr.eu-central-1.amazonaws.com
+    CHART_NAME: cosmos-lb-frontend-chart
+    CHART_VERSION: ${PROJECT_VERSION}-${CI_COMMIT_SHORT_SHA}
+    CHART_PATH: ./helm
+  needs:
+    # - job: 'Code Quality'
+    - job: 'Install'
+      artifacts: true
+    - job: aws-auth
+      artifacts: true
+
+# *** Deploy DEV ***
+'Push changes to GitOps repo for DEV deployment promotion':
+  stage: deploy
+  rules: !reference ['.deploy-dev-rules', rules]
+  extends:
+    - .lib-gitops-update-image-helm
+    - .ca_runners
+  variables:
+    GIT_REPO: 'code.roche.com/lni/modules/gitops/backend/dev-kung-fu-lambdas-ni.git'
+    GIT_USER: ${DEV_CLOUD_GITOPS_RW_USER}
+    GIT_PASS: ${DEV_CLOUD_GITOPS_RW_TOKEN}
+    GIT_MESSAGE: 'updated cosmos-frontend image and chart tag to ${PROJECT_VERSION}-$CI_COMMIT_SHORT_SHA'
+    GIT_BRANCH: 'master'
+    IMAGE_FILE: '.charts/cosmos/cosmos-frontend/values.yaml'
+    IMAGE_KEY: 'cosmos-lb-frontend-chart.image.tag'
+    IMAGE_VALUE: ${PROJECT_VERSION}-${CI_COMMIT_SHORT_SHA}
+    HELM_FILE: '.charts/cosmos/cosmos-frontend/Chart.yaml'
+    HELM_KEY: 'dependencies[0].version'
+    HELM_VALUE: ${PROJECT_VERSION}-${CI_COMMIT_SHORT_SHA}
+  environment:
+    name: dev
+    deployment_tier: development
+  needs:
+    - job: 'Install'
+      artifacts: true
+    - job: 'Publish dev runtime Docker Image to ECR'
+    - job: 'Publish Helm Chart to ECR'
+
+# *** Publish QA ***
+'Publish Xray':
+  stage: publish
+  rules: !reference ['.deploy-qa-rules', rules]
+  extends:
+    - .ca_runners
+    - .publish-xray-helper-execution
+    - .releaseable_branches
+  variables:
+    TMS_LINK_MANDATORY: 'true'
+    TEST_EXECUTION: 'LNI-25443'
+  before_script:
+    - mkdir -p target/allure-results
+    - find -iname '*-result.json' -exec cp {} ./target/allure-results \;
+    - ls -la target/allure-results
+  needs:
+    - job: 'Unit Testing'
+    - job: 'Component Testing'
+    # - job: 'Integration Testing'
+
+'Publish dependencies license report':
+  stage: publish
+  rules: !reference ['.deploy-qa-rules', rules]
+  extends:
+    - .ca_runners
+    - .lib-npm-dependencies-report-gen
+  cache: *npm_cache
+  variables:
+    LICENSE_REPORT_CONFIG_FILE: 'otss-report-configuration.json'
+  needs: ['Install']
+
+'Build qa runtime Docker Image':
+  stage: publish
+  rules: !reference ['.deploy-qa-rules', rules]
+  extends:
+    - .ca_runners
+    - .lib-kaniko-build
+  variables:
+    AWS_ECR: ${AWS_PROD_ACCOUNT_ID}.dkr.ecr.eu-central-1.amazonaws.com
+    DOCKER_FILE: Dockerfile
+    DOCKER_CONTEXT: '.'
+    IMAGE_REPOSITORY: ${AWS_PROD_ECR_RUNTIME_COSMOS_REPO_NAME}
+    IMAGE_TAG: ${CI_COMMIT_TAG}
+  needs:
+    - job: Build
+      artifacts: true
+    - job: aws-auth
+      artifacts: true
+
+'Publish tagged QA runtime Image to PROD ECR':
+  stage: publish
+  rules: !reference ['.deploy-qa-rules', rules]
+  extends:
+    - .ca_runners
+    - .lib-crane-publish-image-oci-ecr-stable
+  variables:
+    AWS_ASSUME_ROLE_NAME: gitlab-cicd-cosmos-lb-frontend
+    IMAGE_REPOSITORY: cosmos-lb-frontend
+  needs:
+    - job: 'Build qa runtime Docker Image'
+      artifacts: true
+
+'Package Helm Chart':
+  stage: publish
+  rules: !reference ['.deploy-qa-rules', rules]
+  extends:
+    - .ca_runners
+    - .lib-helm-package
+  variables:
+    CHART_NAME: cosmos-lb-frontend-chart
+    CHART_VERSION: ${CI_COMMIT_TAG}
+    CHART_PATH: ./helm
+  needs:
+    - job: Build
+      artifacts: true
+    - job: aws-auth
+      artifacts: true
+
+'Publish tagged QA Helm Chart to PROD ECR':
+  stage: publish
+  rules: !reference ['.deploy-qa-rules', rules]
+  extends:
+    - .ca_runners
+    - .lib-helm-publish-chart-oci-ecr-stable
+  variables:
+    AWS_ASSUME_ROLE_NAME: gitlab-cicd-cosmos-lb-frontend
+    CHART_NAME: cosmos-lb-frontend-chart
+  needs:
+    - job: 'Package Helm Chart'
+      artifacts: true
+
+# *** Deploy QA ***
+'Push changes to GitOps repo for QA deployment promotion':
+  stage: deploy
+  rules: !reference ['.deploy-qa-rules', rules]
+  before_script:
+    - free -h
+    - top -b -n 1
+    - ulimit -a
+    - ulimit -S -s 1000000
+    - ulimit -a
+    - ls -la
+  extends:
+    - .lib-gitops-update-image-helm-promotion
+    - .nci_runners
+  variables:
+    GIT_REPO: 'code.roche.com/lni/modules/gitops/backend/qa-ni.git'
+    GIT_USER: ${QA_CLOUD_GITOPS_RW_USER}
+    GIT_PASS: ${QA_CLOUD_GITOPS_RW_TOKEN}
+    GIT_MESSAGE: 'updated cosmos-frontend image and chart tag to ${CI_COMMIT_TAG} ${CI_COMMIT_MESSAGE}'
+    GIT_BRANCH: 'master'
+    GIT_REVIEW_TEAM: ${KFL_TEAM}
+    IMAGE_FILE: '.charts/core-apps/cosmos-frontend/values.yaml'
+    IMAGE_KEY: 'cosmos-lb-frontend-chart.image.tag'
+    IMAGE_VALUE: ${CI_COMMIT_TAG}
+    HELM_FILE: '.charts/core-apps/cosmos-frontend/Chart.yaml'
+    HELM_KEY: 'dependencies[0].version'
+    HELM_VALUE: ${CI_COMMIT_TAG}
+    SVC_NAME: cosmos-frontend
+  environment:
+    name: qa-ni
+    deployment_tier: production
+  needs:
+    - job: 'Publish tagged QA runtime Image to PROD ECR'
+    - job: 'Publish tagged QA Helm Chart to PROD ECR'

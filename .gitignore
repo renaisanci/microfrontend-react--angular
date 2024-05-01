@@ -1,0 +1,27 @@
+# [Optional] npm config
+.npmrc
+
+# Common aux folders & files
+.cache/
+.vscode/
+*.log
+*.tmp
+
+# Dependencies & build artifacts
+node_modules/
+build/
+
+# Environment
+.env
+
+# Reporting artifacts
+reports/
+
+# Win
+desktop.ini
+
+# MacOs
+.DS_Store
+
+# IntelliJ files
+.idea/
